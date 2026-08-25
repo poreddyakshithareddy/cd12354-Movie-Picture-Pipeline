@@ -5,15 +5,15 @@ on:
     branches:
       - main
     paths:
-      - 'starter/frontend/**'
+      - "starter/frontend/**"
+      - ".github/workflows/frontend-cd.yaml"
 
   workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: frontend
-  EKS_CLUSTER_NAME: cluster
-  REACT_APP_MOVIE_API_URL: http://localhost:5000
+  ECR_REPOSITORY: mp-frontend
+  BACKEND_API_URL: http://abbad97c4ffc64880801695bd58f5299-2059525023.us-east-1.elb.amazonaws.com
 
 jobs:
 
@@ -21,59 +21,53 @@ jobs:
     name: Frontend Test
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: starter/frontend
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup NodeJS
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version-file: 'starter/frontend/.nvmrc'
-
-      - name: Cache npm
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('starter/frontend/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+          node-version: 20
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
 
       - name: Install dependencies
-        working-directory: starter/frontend
         run: npm ci
 
       - name: Run tests
-        working-directory: starter/frontend
         run: CI=true npm test -- --watchAll=false
+
 
   lint:
     name: Frontend Lint
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: starter/frontend
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup NodeJS
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version-file: 'starter/frontend/.nvmrc'
-
-      - name: Cache npm
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('starter/frontend/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+          node-version: 20
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
 
       - name: Install dependencies
-        working-directory: starter/frontend
         run: npm ci
 
       - name: Run lint
-        working-directory: starter/frontend
         run: npm run lint
+
 
   build:
     name: Frontend Build
@@ -82,40 +76,37 @@ jobs:
       - test
       - lint
 
-    outputs:
-      image_tag: ${{ steps.tag.outputs.image_tag }}
+    defaults:
+      run:
+        working-directory: starter/frontend
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup NodeJS
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version-file: 'starter/frontend/.nvmrc'
-
-      - name: Cache npm
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('starter/frontend/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+          node-version: 20
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
 
       - name: Install dependencies
-        working-directory: starter/frontend
         run: npm ci
 
+      - name: Build frontend
+        run: |
+          npm run build
+        env:
+          REACT_APP_MOVIE_API_URL: ${{ env.BACKEND_API_URL }}
+
       - name: Build Docker image
-        working-directory: starter/frontend
         run: |
           docker build \
-            --build-arg REACT_APP_MOVIE_API_URL=${{ env.REACT_APP_MOVIE_API_URL }} \
-            --tag ${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+            --build-arg REACT_APP_MOVIE_API_URL=${{ env.BACKEND_API_URL }} \
+            --tag mp-frontend:${{ github.sha }} \
+            .
 
-      - name: Set image tag
-        id: tag
-        run: echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
   push:
     name: Push Frontend Image
@@ -137,13 +128,18 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push image
+      - name: Build and push frontend image
         working-directory: starter/frontend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           docker build \
-            --build-arg REACT_APP_MOVIE_API_URL=${{ env.REACT_APP_MOVIE_API_URL }} \
-            --tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            --build-arg REACT_APP_MOVIE_API_URL=${{ env.BACKEND_API_URL }} \
+            --tag $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            .
+
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
 
   deploy:
     name: Deploy Frontend
@@ -164,18 +160,25 @@ jobs:
       - name: Configure kubectl
         run: |
           aws eks update-kubeconfig \
-            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --name cluster \
             --region ${{ env.AWS_REGION }}
 
       - name: Install kustomize
         run: |
-          curl -sSLo kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.7.1/kustomize_v5.7.1_linux_amd64.tar.gz
-          tar -xzf kustomize.tar.gz
-          sudo mv kustomize /usr/local/bin/
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/kustomize
+
+      - name: Update frontend image
+        working-directory: starter/frontend/k8s
+        run: |
+          ECR_REGISTRY=$(aws ecr describe-repositories \
+            --repository-names ${{ env.ECR_REPOSITORY }} \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+
+          kustomize edit set image frontend=$ECR_REGISTRY:${{ github.sha }}
 
       - name: Deploy frontend
         working-directory: starter/frontend/k8s
         run: |
-          kustomize edit set image frontend=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
           kustomize build | kubectl apply -f -
-
